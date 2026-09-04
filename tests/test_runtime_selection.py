@@ -194,3 +194,22 @@ def test_unimplemented_backend_verb_fails_loudly(tmp_path):
     r = _run_subcmd(_stub_path(tmp_path, "docker"), "status", PROSE_LINT_BACKEND="binary")
     assert r.returncode != 0
     assert "does not implement" in r.stderr
+
+
+def test_blank_backend_matches_the_client_contract(tmp_path):
+    # The client's _backend() strips before testing, so "   " is `container`
+    # there. If the script disagreed, the client would accept the value, shell
+    # out to autostart, and the script would die -- the failure surfacing at
+    # the wrong layer, contradicting the half that just validated it.
+    from prose_check import _backend
+
+    for blank in ("", "   ", "\t"):
+        os.environ["PROSE_LINT_BACKEND"] = blank
+        try:
+            assert _backend() == "container", f"client rejected {blank!r}"
+        finally:
+            os.environ.pop("PROSE_LINT_BACKEND", None)
+        r = _run_subcmd(_stub_path(tmp_path, "docker"), "runtime",
+                        PROSE_LINT_BACKEND=blank)
+        assert r.returncode == 0, f"script rejected {blank!r}: {r.stderr}"
+        assert r.stdout.strip() == "docker"

@@ -60,9 +60,15 @@ BACKENDS="container url binary"
 
 resolve_backend() {
 	local value="${PROSE_LINT_BACKEND:-}"
-	# An empty value reads as unset, matching the PROSE_LINT_RUNTIME test above
-	# and the client's _backend().
-	[ -z "${value}" ] && value="container"
+	# A BLANK value reads as unset, matching the client's _backend(), which
+	# strips before testing. `[ -z ]` alone catches only the truly empty string,
+	# so "   " would die here while the client had already accepted it as
+	# container and shelled out to us -- the failure surfacing at the wrong
+	# layer, with a message contradicting the half that just validated it.
+	case "${value}" in
+	*[![:space:]]*) ;;
+	*) value="container" ;;
+	esac
 	# Exact match per word, NOT a `case " ${BACKENDS} " in *" ${value} "*`
 	# substring test: that accepts any contiguous slice, so "url binary" would
 	# validate and then skip the url refusal below, which is the one guard that
