@@ -41,6 +41,14 @@ def test_with_config_copies_config_dir(tmp_path):
     assert (repo / ".prose-lint-config" / "en-US" / "severity.toml").exists()
 
 
+def test_prints_backend_env_guidance(tmp_path):
+    repo = _git_repo(tmp_path)
+    r = _run(repo)
+    assert r.returncode == 0
+    assert "PROSE_LINT_BACKEND" in r.stdout
+    assert "PROSE_LINT_RUNTIME" in r.stdout
+
+
 def test_prints_hook_snippet(tmp_path):
     repo = _git_repo(tmp_path)
     r = _run(repo)

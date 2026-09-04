@@ -318,6 +318,25 @@ def partition_matches(matches, blocking_ids):
 DEFAULT_SERVER = os.environ.get("PROSE_LINT_SERVER", "http://localhost:8081")
 _DEFAULT_CONFIG_DIR = Path(__file__).resolve().parent.parent / "config"
 _SERVER_SCRIPT = Path(__file__).resolve().parent / "prose-lint-server.sh"
+_BACKENDS = ("container", "url")
+
+
+def _backend():
+    """The selected server backend: 'container' (default) or 'url'.
+
+    Read at call time (not import) so the environment can change under tests
+    and under a hook that sets it per-repo. An unknown value is an error, not
+    a silent fallback.
+    """
+    # `or` (not a get() default) so an empty/whitespace value reads as unset,
+    # matching the shell side's `[ -n "${PROSE_LINT_RUNTIME:-}" ]` test. A blank
+    # var almost always means "not configured", not "configured to nothing".
+    value = os.environ.get("PROSE_LINT_BACKEND", "").strip() or "container"
+    if value not in _BACKENDS:
+        raise ValueError(
+            f"unknown PROSE_LINT_BACKEND {value!r} (valid: {', '.join(_BACKENDS)})"
+        )
+    return value
 
 
 def _read_wordlist(path):
@@ -369,12 +388,28 @@ def _start_server():
     subprocess.run([str(_SERVER_SCRIPT), "start"], check=False)
 
 
-def ensure_server(server, start_fn=_start_server, is_up=server_is_up):
-    """Ensure the server is reachable, starting it once if it is not."""
+def ensure_server(server, start_fn=_start_server, is_up=server_is_up, backend=None):
+    """Ensure the server is reachable, starting it once if it is not.
+
+    Under the 'url' backend the server is preexisting/remote, so it is probed
+    but never started.
+    """
     if is_up(server):
         return True
+    if (backend or _backend()) == "url":
+        return False
     start_fn()
     return is_up(server)
+
+
+def _unreachable_hint(backend):
+    """What to tell the user when the server cannot be reached, per backend."""
+    if backend == "url":
+        return (
+            "PROSE_LINT_BACKEND=url: start your own server, or unset it "
+            "to let prose-check run a container."
+        )
+    return "Start it manually with: bin/prose-lint-server.sh start"
 
 
 def _post_check(server, text, bundle):
@@ -547,14 +582,22 @@ def main(argv=None):
 
     had_blocking = False
 
-    if not args.no_autostart and args.files and not ensure_server(args.server):
-        print(
-            f"prose-check: LanguageTool server unreachable at {args.server} "
-            "and could not be started.",
-            file=sys.stderr,
-        )
-        print("Start it manually with: bin/prose-lint-server.sh start", file=sys.stderr)
+    # Validated unconditionally: a typo must not pass silently just because
+    # --no-autostart or an empty file list happens to skip the probe below.
+    try:
+        backend = _backend()
+    except ValueError as exc:
+        print(f"prose-check: {exc}", file=sys.stderr)
         return 2
+
+    if not args.no_autostart and args.files:
+        if not ensure_server(args.server, backend=backend):
+            print(
+                f"prose-check: LanguageTool server unreachable at {args.server}.",
+                file=sys.stderr,
+            )
+            print(_unreachable_hint(backend), file=sys.stderr)
+            return 2
 
     profile = args.profile
     ignore_patterns = _resolve_i18n_ignore(args.i18n_ignore)
@@ -591,7 +634,7 @@ def main(argv=None):
                 f"prose-check: LanguageTool server unreachable at {args.server}: {exc}",
                 file=sys.stderr,
             )
-            print("Start it with: bin/prose-lint-server.sh start", file=sys.stderr)
+            print(_unreachable_hint(backend), file=sys.stderr)
             return 2
         blocking, advisory = partition_matches(findings, blocking_ids)
         for finding in blocking:

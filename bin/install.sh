@@ -77,6 +77,10 @@ fi
 echo
 echo "The client auto-starts the container on demand if it is stopped."
 echo "To manage it manually: ${TOOLING_DIR}/bin/prose-lint-server.sh start"
+echo "The container runtime is auto-detected (docker, podman, nerdctl);"
+echo "set PROSE_LINT_RUNTIME to pin one."
+echo "Already run a shared LanguageTool server? Set PROSE_LINT_BACKEND=url and"
+echo "PROSE_LINT_SERVER=<its url>; prose-check will then never start a container."
 echo
 echo "2a) For a .githooks/pre-commit (bash) repo, add this section:"
 echo
