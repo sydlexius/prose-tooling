@@ -131,3 +131,66 @@ def test_stop_fails_loudly_when_the_stop_fails(tmp_path):
     assert r.returncode != 0
     assert "not running" not in r.stdout
     assert "failed to stop" in r.stderr
+
+
+def _run_subcmd(path, subcmd, **env):
+    environ = dict(os.environ)
+    environ["PATH"] = path
+    environ.pop("PROSE_LINT_RUNTIME", None)
+    environ.update(env)
+    return subprocess.run(
+        [str(SERVER), subcmd], capture_output=True, text=True, env=environ
+    )
+
+
+def test_binary_backend_does_not_require_a_container_runtime(tmp_path):
+    # The regression test for load-time resolution: with NO container runtime
+    # on PATH at all, selecting a non-container backend must not die at load.
+    r = _run_subcmd(_stub_path(tmp_path), "status", PROSE_LINT_BACKEND="binary")
+    assert "no container runtime found" not in r.stderr
+
+
+def test_container_backend_still_requires_a_runtime(tmp_path):
+    r = _run_subcmd(_stub_path(tmp_path), "status", PROSE_LINT_BACKEND="container")
+    assert r.returncode != 0
+    assert "no container runtime found" in r.stderr
+
+
+def test_unknown_backend_dies(tmp_path):
+    r = _run_subcmd(
+        _stub_path(tmp_path, "docker"), "status", PROSE_LINT_BACKEND="jar"
+    )
+    assert r.returncode != 0
+    assert "jar" in r.stderr
+    assert "container" in r.stderr  # names the valid set
+
+
+def test_url_backend_refuses_lifecycle_commands(tmp_path):
+    # A server we did not start is not ours to manage.
+    r = _run_subcmd(
+        _stub_path(tmp_path, "docker"), "start", PROSE_LINT_BACKEND="url"
+    )
+    assert r.returncode != 0
+    # Assert the REFUSAL, not merely a non-zero exit mentioning "url": with the
+    # refusal deleted, dispatch still errors with "backend 'url' does not
+    # implement 'start'", which satisfied both of those and left the test inert.
+    assert "not ours to manage" in r.stderr
+
+
+def test_multi_word_backend_value_is_rejected(tmp_path):
+    # " container url binary " contains "url binary" as a substring, so a
+    # substring allowlist would validate it and then skip the url refusal.
+    r = _run_subcmd(
+        _stub_path(tmp_path, "docker"), "runtime", PROSE_LINT_BACKEND="url binary"
+    )
+    assert r.returncode != 0
+    assert "url binary" in r.stderr
+
+
+def test_unimplemented_backend_verb_fails_loudly(tmp_path):
+    # An indirect dispatch to a missing function must not look like success:
+    # bash's "command not found" can exit 0 on some paths, which for `status`
+    # would read as "the server is fine" when nothing was checked.
+    r = _run_subcmd(_stub_path(tmp_path, "docker"), "status", PROSE_LINT_BACKEND="binary")
+    assert r.returncode != 0
+    assert "does not implement" in r.stderr
