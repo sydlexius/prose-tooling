@@ -12,7 +12,11 @@ import pytest
 
 import prose_check
 
-SERVER = prose_check.DEFAULT_SERVER
+# The same fixed default the conftest fixture pins prose_check.DEFAULT_SERVER
+# to. Reading prose_check.DEFAULT_SERVER here would capture any ambient
+# PROSE_LINT_SERVER at COLLECTION time, before the fixture runs, so the skip
+# gate could probe one server while the test body checks against another.
+SERVER = "http://localhost:8081"
 FIXTURES = Path(__file__).parent / "fixtures"
 
 

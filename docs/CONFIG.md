@@ -148,3 +148,57 @@ Two ways to bring your own rules, from least to most involved:
 Either way, the scaffolded/copied `severity.toml` files are yours to edit
 freely -- add domain nouns to `dictionary.txt`, tune `disabled_rules` for your
 prose, and keep `blocking` narrow per "Choosing what to block" above.
+
+## Backends and runtimes
+
+Where the LanguageTool server lives is configured entirely by environment
+variables. With none set, prose-check auto-starts a local container -- the
+behavior it has always had.
+
+| Variable | Values | Default | Meaning |
+| --- | --- | --- | --- |
+| `PROSE_LINT_SERVER` | a URL | `http://localhost:8081` | The server the client checks against. |
+| `PROSE_LINT_PORT` | a port | `8081` | Host port the container binds on `127.0.0.1`. |
+| `PROSE_LINT_BACKEND` | `container`, `url` | `container` | Whether prose-check may start a server. |
+| `PROSE_LINT_RUNTIME` | `docker`, `podman`, `nerdctl` | auto-detect | Which container runtime the server script drives. |
+
+**`container` (default).** When the server is unreachable, the client runs
+`bin/prose-lint-server.sh start`, which starts the stock
+`erikvl87/languagetool` image bound to `127.0.0.1:${PROSE_LINT_PORT}` with
+`--restart unless-stopped`.
+
+**`url`.** The server is yours and already running (a shared box, a service in
+your dev compose stack, a systemd unit). The client probes `PROSE_LINT_SERVER`
+and, if it is unreachable, exits 2 with guidance rather than starting a
+container.
+
+Prose is sent to whatever server `PROSE_LINT_SERVER` names, so under this
+backend the privacy boundary is yours to set: point it at a server you control
+and trust. A URL outside your network sends repo content there, and the public
+LanguageTool API is never an appropriate target for private content.
+
+**Runtime resolution.** The server script picks its runtime once, in this
+order:
+
+1. `PROSE_LINT_RUNTIME` if set. It must name one of `docker`, `podman`,
+   `nerdctl` and be on `PATH`; otherwise the script exits non-zero. There is no
+   fallback to another runtime, so a typo fails loudly instead of silently
+   using the wrong thing.
+2. Otherwise the first of `docker`, `podman`, `nerdctl` found on `PATH`.
+3. Otherwise it exits non-zero, suggesting `PROSE_LINT_RUNTIME` or
+   `PROSE_LINT_BACKEND=url`.
+
+Check what it resolved to without starting anything:
+
+```sh
+bin/prose-lint-server.sh runtime   # prints e.g. podman
+```
+
+Rootless podman and nerdctl work: the container binds to `127.0.0.1` and the
+`--restart unless-stopped` policy is supported by all three runtimes.
+
+An empty value means "not set" for both `PROSE_LINT_BACKEND` and
+`PROSE_LINT_RUNTIME`, so `PROSE_LINT_BACKEND="${SOME_UNSET_VAR}"` in a CI job
+falls back to the default rather than failing. Any other value outside the valid
+set is an error, including one that is merely padded with whitespace -- pass
+`docker`, not `" docker "`.

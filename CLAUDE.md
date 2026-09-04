@@ -38,7 +38,11 @@ into blocking vs advisory per a central per-language house-style config. See
   prose blocks tagged with source line -> one LanguageTool check -> allowlist
   filter -> severity partition -> `path:line` findings. Auto-starts the
   container when it is down (`--no-autostart` to disable).
-- `bin/prose-lint-server.sh` - LanguageTool container lifecycle (OrbStack/Docker).
+- `bin/prose-lint-server.sh` - LanguageTool container lifecycle. The runtime is
+  resolved once (`PROSE_LINT_RUNTIME`, else first of docker/podman/nerdctl on
+  PATH, else die); `prose-lint-server.sh runtime` prints the choice.
+  `PROSE_LINT_BACKEND=url` makes the client use a preexisting server and never
+  autostart. Documented in `docs/CONFIG.md`.
 - `bin/install.sh` - prints the git-hook wiring for a consuming repo.
 - `config/<lang>/severity.toml` + dictionaries - per-language rule set,
   blocking/advisory map, and spelling allowlist. `config/dictionary.txt` is the

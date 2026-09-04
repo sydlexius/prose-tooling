@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
-# prose-lint-server.sh -- manage the local LanguageTool container (OrbStack).
+# prose-lint-server.sh -- manage the local LanguageTool container.
 #
 # The grammar linter checks against a LOCAL LanguageTool server only; repo
 # content is never sent to the public API. This starts a stock
-# erikvl87/languagetool container bound to localhost, kept alive by the Docker
-# engine (OrbStack) with a restart policy so it survives reboots.
+# erikvl87/languagetool container bound to localhost with a restart policy so
+# it survives reboots.
 #
-# Usage: prose-lint-server.sh {start|stop|status|restart}
+# The container runtime is docker, podman, or nerdctl: set PROSE_LINT_RUNTIME
+# to pick one, otherwise the first found on PATH wins (in that order).
+#
+# Usage: prose-lint-server.sh {start|stop|status|restart|runtime}
 set -euo pipefail
 
 IMAGE="erikvl87/languagetool:latest"
@@ -19,10 +22,33 @@ die() {
 	echo "prose-lint-server: $*" >&2
 	exit 1
 }
-command -v docker >/dev/null 2>&1 || die "docker (OrbStack) not found on PATH"
+RUNTIMES="docker podman nerdctl"
 
-running() { [ -n "$(docker ps -q -f "name=^${NAME}$")" ]; }
-exists() { [ -n "$(docker ps -aq -f "name=^${NAME}$")" ]; }
+resolve_runtime() {
+	local candidate
+	if [ -n "${PROSE_LINT_RUNTIME:-}" ]; then
+		case " ${RUNTIMES} " in
+		*" ${PROSE_LINT_RUNTIME} "*) ;;
+		*) die "unknown PROSE_LINT_RUNTIME '${PROSE_LINT_RUNTIME}' (valid: ${RUNTIMES})" ;;
+		esac
+		command -v "${PROSE_LINT_RUNTIME}" >/dev/null 2>&1 ||
+			die "PROSE_LINT_RUNTIME '${PROSE_LINT_RUNTIME}' not found on PATH"
+		echo "${PROSE_LINT_RUNTIME}"
+		return 0
+	fi
+	for candidate in ${RUNTIMES}; do
+		if command -v "${candidate}" >/dev/null 2>&1; then
+			echo "${candidate}"
+			return 0
+		fi
+	done
+	die "no container runtime found (${RUNTIMES}); set PROSE_LINT_RUNTIME or use PROSE_LINT_BACKEND=url"
+}
+
+RUNTIME="$(resolve_runtime)" || exit 1
+
+running() { [ -n "$("${RUNTIME}" ps -q -f "name=^${NAME}$")" ]; }
+exists() { [ -n "$("${RUNTIME}" ps -aq -f "name=^${NAME}$")" ]; }
 
 start() {
 	if running; then
@@ -30,11 +56,11 @@ start() {
 		return 0
 	fi
 	if exists; then
-		docker start "${NAME}" >/dev/null
+		"${RUNTIME}" start "${NAME}" >/dev/null
 	else
-		# --restart unless-stopped: OrbStack brings it back on boot.
+		# --restart unless-stopped: the runtime brings it back on boot.
 		# Java_Xmx caps heap; no n-gram data in v1 (large download).
-		docker run -d \
+		"${RUNTIME}" run -d \
 			--name "${NAME}" \
 			--restart unless-stopped \
 			-p "127.0.0.1:${HOST_PORT}:${CONTAINER_PORT}" \
@@ -49,11 +75,19 @@ start() {
 		fi
 		sleep 1
 	done
-	die "server did not become ready within 30s (see: docker logs ${NAME})"
+	die "server did not become ready within 30s (see: ${RUNTIME} logs ${NAME})"
 }
 
 stop() {
-	running && docker stop "${NAME}" >/dev/null && echo "stopped" || echo "not running"
+	# Not an `a && b || c` chain: that reports "not running" when the container
+	# IS running and the stop merely FAILED (a live case under rootless podman),
+	# leaving the user misinformed and the exit code 0.
+	if ! running; then
+		echo "not running"
+		return 0
+	fi
+	"${RUNTIME}" stop "${NAME}" >/dev/null || die "failed to stop ${NAME}"
+	echo "stopped"
 }
 
 status() {
@@ -74,5 +108,6 @@ restart)
 	start
 	;;
 status) status ;;
-*) die "usage: $0 {start|stop|status|restart}" ;;
+runtime) echo "${RUNTIME}" ;;
+*) die "usage: $0 {start|stop|status|restart|runtime}" ;;
 esac
