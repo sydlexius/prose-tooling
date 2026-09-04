@@ -111,13 +111,120 @@ require_java() {
 		die "java on PATH is not a working runtime (on macOS /usr/bin/java is a stub until a JDK is installed)"
 }
 
+pid_file() {
+	local dir="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}"
+	echo "${dir%/}/prose-lint-lt-${HOST_PORT}.pid"
+}
+
+log_file() {
+	local dir="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}"
+	echo "${dir%/}/prose-lint-lt-${HOST_PORT}.log"
+}
+
+# True when the pid is alive AND its command line still looks like our server.
+# `ps -ww` because a `java -cp` command line is long, and a truncated one would
+# fail to match, making stop() refuse to act on its own process.
+pid_is_ours() {
+	local pid="$1"
+	kill -0 "${pid}" 2>/dev/null || return 1
+	ps -ww -o command= -p "${pid}" 2>/dev/null |
+		grep -qiE 'languagetool|HTTPServer'
+}
+
 binary_start() {
-	local resolved
+	local resolved kind value pidf logf timeout waited
+	if curl -fsS "${URL}/v2/languages" >/dev/null 2>&1; then
+		echo "already running at ${URL}"
+		return 0
+	fi
 	resolved="$(resolve_launcher)" || exit 1
-	case "${resolved}" in
-	jar:*) require_java ;;
+	kind="${resolved%%:*}"
+	value="${resolved#*:}"
+	pidf="$(pid_file)"
+	logf="$(log_file)"
+	timeout="${PROSE_LINT_START_TIMEOUT:-30}"
+
+	# Detached, with output redirected to the log: an inherited stdout would
+	# keep a CI step's pipe open and hang the job until the runner's timeout.
+	# No --public flag, so the server binds loopback only.
+	if [ "${kind}" = "jar" ]; then
+		require_java
+		nohup java -Xmx1g -cp "${value}" org.languagetool.server.HTTPServer \
+			--port "${HOST_PORT}" >"${logf}" 2>&1 &
+	else
+		nohup "${value}" --port "${HOST_PORT}" >"${logf}" 2>&1 &
+	fi
+	echo $! >"${pidf}"
+
+	echo "starting LanguageTool at ${URL} ..."
+	waited=0
+	while [ "${waited}" -lt "${timeout}" ]; do
+		if curl -fsS "${URL}/v2/languages" >/dev/null 2>&1; then
+			echo "ready at ${URL}"
+			return 0
+		fi
+		sleep 1
+		waited=$((waited + 1))
+	done
+	die "server did not become ready within ${timeout}s (see: ${logf})"
+}
+
+binary_stop() {
+	local pidf pid waited
+	pidf="$(pid_file)"
+	if [ ! -f "${pidf}" ]; then
+		echo "not running"
+		return 0
+	fi
+	pid="$(cat "${pidf}" 2>/dev/null || true)"
+	case "${pid}" in
+	'' | *[!0-9]*)
+		rm -f "${pidf}"
+		echo "not running (unreadable pid file removed)"
+		return 0
+		;;
 	esac
-	die "binary_start not implemented yet"
+	if ! kill -0 "${pid}" 2>/dev/null; then
+		rm -f "${pidf}"
+		echo "not running (stale pid file removed)"
+		return 0
+	fi
+	if ! pid_is_ours "${pid}"; then
+		# NEVER signal a process we cannot identify as ours: PIDs are recycled,
+		# and killing an unrelated process is the failure mode to avoid.
+		rm -f "${pidf}"
+		echo "not running (pid ${pid} was recycled by another process; not signaled)"
+		return 0
+	fi
+	kill "${pid}" 2>/dev/null || die "failed to signal pid ${pid}"
+	waited=0
+	while [ "${waited}" -lt 10 ]; do
+		kill -0 "${pid}" 2>/dev/null || break
+		sleep 1
+		waited=$((waited + 1))
+	done
+	if kill -0 "${pid}" 2>/dev/null; then
+		kill -9 "${pid}" 2>/dev/null || true
+		echo "stopped (SIGKILL after ${waited}s)"
+	else
+		echo "stopped"
+	fi
+	rm -f "${pidf}"
+}
+
+binary_status() {
+	local pidf pid
+	pidf="$(pid_file)"
+	pid=""
+	[ -f "${pidf}" ] && pid="$(cat "${pidf}" 2>/dev/null || true)"
+	if [ -n "${pid}" ] && pid_is_ours "${pid}"; then
+		echo "running at ${URL} (pid ${pid})"
+		curl -fsS "${URL}/v2/languages" >/dev/null 2>&1 &&
+			echo "health: OK" || echo "health: NOT READY"
+	else
+		echo "not running"
+		exit 1
+	fi
 }
 
 container_running() {

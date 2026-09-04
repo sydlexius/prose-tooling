@@ -25,11 +25,22 @@ def _bin_dir(tmp_path, *names):
         stub = d / name
         stub.write_text("#!/bin/sh\nexit 0\n")
         stub.chmod(0o755)
-    bash = shutil.which("bash")
-    assert bash, "bash is required to run the server script"
-    if not (d / "bash").exists():
-        (d / "bash").symlink_to(bash)
+    # The lifecycle paths shell out to real coreutils (unlike discovery, which
+    # is bash builtins only), so symlink the ones the script actually uses.
+    # Everything else is deliberately absent: a real java or languagetool-server
+    # on the developer's machine must not satisfy a lookup a test means to fail.
+    for tool in ("bash", "rm", "sleep", "cat", "ps", "grep", "curl", "kill"):
+        real = shutil.which(tool)
+        if real and not (d / tool).exists():
+            (d / tool).symlink_to(real)
+    assert (d / "bash").exists(), "bash is required to run the server script"
     return d
+
+
+# A port nothing is listening on, so `start`'s "already running" probe cannot
+# find the developer's real LanguageTool container and short-circuit. 8081 is
+# the default and IS live on this machine.
+TEST_PORT = "18099"
 
 
 def _run(path_dir, subcmd, **env):
@@ -38,6 +49,7 @@ def _run(path_dir, subcmd, **env):
     for var in ("PROSE_LINT_RUNTIME", "PROSE_LINT_JAR", "PROSE_LINT_START_TIMEOUT"):
         environ.pop(var, None)
     environ["PROSE_LINT_BACKEND"] = "binary"
+    environ["PROSE_LINT_PORT"] = TEST_PORT
     environ.update(env)
     return subprocess.run(
         [str(SERVER), subcmd], capture_output=True, text=True, env=environ
@@ -103,3 +115,101 @@ def test_launcher_path_does_not_probe_java(tmp_path):
     r = _run(d, "launcher")
     assert r.returncode == 0
     assert r.stdout.strip() == "launcher:languagetool-server"
+
+
+def _reap(pid):
+    """Best-effort cleanup of a detached child that may already have exited."""
+    try:
+        os.kill(pid, 15)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def _server_stub(d, name, sleep_secs=30):
+    """A stub whose process name matches the stop() safety check."""
+    stub = d / name
+    stub.write_text(f"#!/bin/sh\nexec sleep {sleep_secs}\n")
+    stub.chmod(0o755)
+    return stub
+
+
+def test_stop_reports_not_running_without_a_pid_file(tmp_path):
+    d = _bin_dir(tmp_path, "languagetool-server")
+    r = _run(d, "stop", TMPDIR=str(tmp_path), XDG_RUNTIME_DIR=str(tmp_path))
+    assert r.returncode == 0
+    assert "not running" in r.stdout
+
+
+def test_stop_removes_a_stale_pid_file_without_signaling(tmp_path):
+    d = _bin_dir(tmp_path, "languagetool-server")
+    pid_file = tmp_path / f"prose-lint-lt-{TEST_PORT}.pid"
+    # PID 999999 is above the default pid_max on Linux and macOS: not alive.
+    pid_file.write_text("999999\n")
+    r = _run(d, "stop", TMPDIR=str(tmp_path), XDG_RUNTIME_DIR=str(tmp_path))
+    assert r.returncode == 0
+    assert "not running" in r.stdout
+    assert not pid_file.exists()
+
+
+def test_stop_refuses_to_signal_a_recycled_pid(tmp_path):
+    # The dangerous case: the PID file names a LIVE process that is not ours.
+    # It must survive untouched. `sleep` does not match the LanguageTool
+    # command-line pattern, so it stands in for an unrelated process.
+    d = _bin_dir(tmp_path)
+    victim = subprocess.Popen(["sleep", "30"])
+    try:
+        pid_file = tmp_path / f"prose-lint-lt-{TEST_PORT}.pid"
+        pid_file.write_text(f"{victim.pid}\n")
+        r = _run(d, "stop", TMPDIR=str(tmp_path), XDG_RUNTIME_DIR=str(tmp_path))
+        assert victim.poll() is None, "stop() killed an unrelated process"
+        assert "recycled" in (r.stdout + r.stderr).lower()
+        assert not pid_file.exists()
+    finally:
+        victim.kill()
+        victim.wait()
+
+
+def test_start_writes_a_pid_file_and_returns_promptly(tmp_path):
+    # The launcher never becomes healthy, so start times out -- but it must
+    # still have written the PID file and detached, and must not hang.
+    d = _bin_dir(tmp_path)
+    _server_stub(d, "languagetool-server")
+    r = _run(
+        d, "start",
+        TMPDIR=str(tmp_path), XDG_RUNTIME_DIR=str(tmp_path),
+        PROSE_LINT_START_TIMEOUT="2",
+    )
+    assert r.returncode != 0  # never became ready
+    assert "did not become ready" in r.stderr
+    pid_file = tmp_path / f"prose-lint-lt-{TEST_PORT}.pid"
+    assert pid_file.exists()
+    # Clean up the detached child. It may already be gone (the stub`s `exec`
+    # replaces the recorded wrapper), so a missing process is not a failure --
+    # what is asserted above is that start RECORDED a pid, not that it lives.
+    _reap(int(pid_file.read_text().strip()))
+
+
+def test_start_respects_the_timeout_knob(tmp_path):
+    import time
+
+    d = _bin_dir(tmp_path)
+    _server_stub(d, "languagetool-server")
+    began = time.monotonic()
+    r = _run(
+        d, "start",
+        TMPDIR=str(tmp_path), XDG_RUNTIME_DIR=str(tmp_path),
+        PROSE_LINT_START_TIMEOUT="2",
+    )
+    elapsed = time.monotonic() - began
+    assert r.returncode != 0
+    assert elapsed < 20, f"ignored PROSE_LINT_START_TIMEOUT=2 (took {elapsed:.1f}s)"
+    pid_file = tmp_path / f"prose-lint-lt-{TEST_PORT}.pid"
+    if pid_file.exists():
+        _reap(int(pid_file.read_text().strip()))
+
+
+def test_status_reports_not_running_without_a_pid_file(tmp_path):
+    d = _bin_dir(tmp_path, "languagetool-server")
+    r = _run(d, "status", TMPDIR=str(tmp_path), XDG_RUNTIME_DIR=str(tmp_path))
+    assert r.returncode != 0
+    assert "not running" in r.stdout
