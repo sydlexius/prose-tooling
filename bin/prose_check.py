@@ -401,7 +401,15 @@ def ensure_server(server, start_fn=_start_server, is_up=server_is_up, backend=No
     # Resolved BEFORE the reachability probe: the signature documents
     # backend=None as "read _backend()", so an invalid value must raise even
     # when the server happens to be up, rather than depending on probe order.
-    backend = backend or _backend()
+    # An explicit argument is validated too -- otherwise backend="jar" silently
+    # takes the container path and starts a container for a backend that does
+    # not exist.
+    if backend is None:
+        backend = _backend()
+    elif backend not in _BACKENDS:
+        raise ValueError(
+            f"unknown backend {backend!r} (valid: {', '.join(_BACKENDS)})"
+        )
     if is_up(server):
         return True
     if backend == "url":
