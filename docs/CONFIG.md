@@ -170,8 +170,12 @@ behavior it has always had.
 **`url`.** The server is yours and already running (a shared box, a service in
 your dev compose stack, a systemd unit). The client probes `PROSE_LINT_SERVER`
 and, if it is unreachable, exits 2 with guidance rather than starting a
-container. Nothing is ever sent off your network -- point this at your own
-server, never at the public LanguageTool API.
+container.
+
+Prose is sent to whatever server `PROSE_LINT_SERVER` names, so under this
+backend the privacy boundary is yours to set: point it at a server you control
+and trust. A URL outside your network sends repo content there, and the public
+LanguageTool API is never an appropriate target for private content.
 
 **Runtime resolution.** The server script picks its runtime once, in this
 order:

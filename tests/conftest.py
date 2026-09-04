@@ -25,3 +25,10 @@ def _scrub_prose_lint_env(monkeypatch):
     """
     for var in _PROSE_LINT_ENV:
         monkeypatch.delenv(var, raising=False)
+    # DEFAULT_SERVER is computed at import, so it already captured any ambient
+    # PROSE_LINT_SERVER before this fixture ran; deleting the var cannot undo
+    # that. Reset the constant too, or a test calling main() without --server
+    # silently targets the developer's configured server.
+    import prose_check
+
+    monkeypatch.setattr(prose_check, "DEFAULT_SERVER", "http://localhost:8081")

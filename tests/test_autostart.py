@@ -91,6 +91,23 @@ def test_backend_rejects_whitespace_padded_value(monkeypatch):
     assert "' url '" in str(excinfo.value)
 
 
+def test_default_server_is_reset_despite_ambient_env():
+    # DEFAULT_SERVER is import-time, so the conftest fixture must reset the
+    # constant, not just delete the var -- otherwise a developer's configured
+    # server leaks into any test calling main() without --server.
+    import prose_check
+
+    assert prose_check.DEFAULT_SERVER == "http://localhost:8081"
+
+
+def test_ensure_server_validates_backend_even_when_reachable(monkeypatch):
+    # The signature documents backend=None as "read _backend()", so validation
+    # must not depend on whether the reachability probe short-circuits first.
+    monkeypatch.setenv("PROSE_LINT_BACKEND", "jar")
+    with pytest.raises(ValueError):
+        ensure_server("url", start_fn=lambda: None, is_up=lambda u: True)
+
+
 def test_unreachable_hint_is_backend_specific():
     assert "prose-lint-server.sh start" in _unreachable_hint("container")
     url_hint = _unreachable_hint("url")

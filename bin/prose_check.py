@@ -398,9 +398,13 @@ def ensure_server(server, start_fn=_start_server, is_up=server_is_up, backend=No
     Under the 'url' backend the server is preexisting/remote, so it is probed
     but never started.
     """
+    # Resolved BEFORE the reachability probe: the signature documents
+    # backend=None as "read _backend()", so an invalid value must raise even
+    # when the server happens to be up, rather than depending on probe order.
+    backend = backend or _backend()
     if is_up(server):
         return True
-    if (backend or _backend()) == "url":
+    if backend == "url":
         return False
     start_fn()
     return is_up(server)
