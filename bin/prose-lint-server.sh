@@ -122,6 +122,13 @@ require_java() {
 	fi
 }
 
+# Every probe is BOUNDED. An unbounded curl against a JVM that has accepted the
+# connection but is mid-shutdown hangs a pre-commit hook or CI step with no
+# output at all -- the same defect this file already bounds require_java for.
+server_responds() {
+	curl -fsS --connect-timeout 2 --max-time 5 "${URL}/v2/languages" >/dev/null 2>&1
+}
+
 state_dir() {
 	local dir="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}"
 	echo "${dir%/}"
@@ -143,7 +150,12 @@ read_pid() {
 	# lacked `cat` made every pid look unreadable, so stop() deleted the file
 	# and abandoned a live server -- silently, and with a message blaming the
 	# file. Reading state is not the place to take a dependency.
-	IFS= read -r raw <"$1" 2>/dev/null || raw=""
+	# `|| true`, NOT `|| raw=""`: `read` returns non-zero at EOF-without-newline
+	# while still assigning, so clearing on failure would DISCARD a good pid and
+	# send stop down the "no usable pid" path -- deleting the file and
+	# abandoning a live server, the exact bug this function exists to prevent.
+	[ -f "$1" ] || return 0
+	IFS= read -r raw <"$1" 2>/dev/null || true
 	raw="${raw//[[:space:]]/}"
 	case "${raw}" in
 	'' | *[!0-9]*) return 0 ;;
@@ -155,6 +167,28 @@ read_pid() {
 # True when the pid is alive AND its command line still looks like our server.
 # `ps -ww` because a `java -cp` command line is long, and a truncated one would
 # fail to match, making stop() refuse to act on its own process.
+# Does any process in the group still look like our server? Used when the
+# recorded leader has exited but the group may still hold the real process.
+group_looks_ours() {
+	local pgid="$1" line
+	command -v ps >/dev/null 2>&1 || return 1
+	# Parsed with shell builtins, no awk. Adding an external dependency here
+	# would repeat the very mistake this function exists to undo -- `cat` and
+	# `grep` already made stop abandon a live server when they were missing.
+	local first rest
+	while IFS= read -r line; do
+		first="${line%%[[:space:]]*}"
+		[ "${first}" = "${pgid}" ] || continue
+		rest="${line#"${first}"}"
+		case "${rest}" in
+		*[Ll]anguage[Tt]ool* | *HTTPServer*) return 0 ;;
+		esac
+	done <<EOF
+$(ps -ww -eo pgid=,command= 2>/dev/null)
+EOF
+	return 1
+}
+
 pid_is_ours() {
 	local pid="$1" cmdline
 	kill -0 "${pid}" 2>/dev/null || return 1
@@ -162,9 +196,14 @@ pid_is_ours() {
 	# restricted PATH). Distinguish "ps says this is not ours" from "ps could
 	# not run": the first is a refusal, the second must not silently become
 	# one, or a missing binary makes the tool abandon a live server.
-	command -v ps >/dev/null 2>&1 || {
-		die "cannot verify pid ${pid} -- 'ps' is not available; refusing to signal blindly"
-	}
+	if ! command -v ps >/dev/null 2>&1; then
+		# Fatal only for a caller about to SIGNAL. For a caller merely asking
+		# "is one already running?", refusing to launch is the worse answer --
+		# it turns a missing tool into a hard failure on a path that worked.
+		[ "${2:-signal}" = "signal" ] &&
+			die "cannot verify pid ${pid} -- 'ps' is not available; refusing to signal blindly"
+		return 1
+	fi
 	cmdline="$(ps -ww -o command= -p "${pid}" 2>/dev/null || true)"
 	case "${cmdline}" in
 	*[Ll]anguage[Tt]ool* | *HTTPServer*) return 0 ;;
@@ -203,7 +242,7 @@ spawn_detached() {
 
 binary_start() {
 	local resolved kind value pidf logf timeout waited runtime_dir existing
-	if curl -fsS "${URL}/v2/languages" >/dev/null 2>&1; then
+	if server_responds; then
 		echo "already running at ${URL}"
 		return 0
 	fi
@@ -222,7 +261,7 @@ binary_start() {
 	# exactly when a pre-commit hook and a manual start collide.
 	if [ -f "${pidf}" ]; then
 		existing="$(read_pid "${pidf}")"
-		if [ -n "${existing}" ] && pid_is_ours "${existing}"; then
+		if [ -n "${existing}" ] && pid_is_ours "${existing}" probe; then
 			die "a LanguageTool process (pid ${existing}) is already starting or running; stop it first"
 		fi
 	fi
@@ -243,13 +282,18 @@ binary_start() {
 	else
 		spawn_detached "${logf}" "${value}" --port "${HOST_PORT}"
 	fi
-	echo "${SPAWNED_PID}" >"${pidf}" ||
-		die "cannot write pid file '${pidf}'"
+	if ! echo "${SPAWNED_PID}" >"${pidf}"; then
+		# The child is already running. Dying here without reaping it orphans a
+		# server that nothing records -- unfindable by the double-start guard,
+		# because the file it would consult was never written.
+		kill -- -"${SPAWNED_PID}" 2>/dev/null || kill "${SPAWNED_PID}" 2>/dev/null || true
+		die "cannot write pid file '${pidf}'; the server just started was stopped again"
+	fi
 
 	echo "starting LanguageTool at ${URL} ..."
 	waited=0
 	while [ "${waited}" -lt "${timeout}" ]; do
-		if curl -fsS "${URL}/v2/languages" >/dev/null 2>&1; then
+		if server_responds; then
 			echo "ready at ${URL}"
 			return 0
 		fi
@@ -278,12 +322,17 @@ binary_stop() {
 		echo "not running (pid file held no usable pid; removed)"
 		return 0
 	fi
-	if ! kill -0 "${pid}" 2>/dev/null; then
+	# Liveness is a property of the GROUP, not the leader. A launcher that
+	# forks and exits leaves the recorded leader dead while its child lives on
+	# in the same group -- reparented to init, but the pgid is retained. Gating
+	# on the leader here declared that live server "stale", removed the pid
+	# file, and returned success without ever trying to stop it.
+	if ! kill -0 -- -"${pid}" 2>/dev/null && ! kill -0 "${pid}" 2>/dev/null; then
 		rm -f "${pidf}"
 		echo "not running (stale pid file removed)"
 		return 0
 	fi
-	if ! pid_is_ours "${pid}"; then
+	if ! pid_is_ours "${pid}" && ! group_looks_ours "${pid}"; then
 		# NEVER signal a process we cannot identify as ours: PIDs are recycled,
 		# and killing an unrelated process is the failure mode to avoid.
 		rm -f "${pidf}"
@@ -298,25 +347,31 @@ binary_stop() {
 	# this tool can never stop.
 	signal_tree() { kill -"$1" -- -"${pid}" 2>/dev/null || kill -"$1" "${pid}" 2>/dev/null || true; }
 
+	# Observe the GROUP, not the leader. The leader here is a shell wrapper
+	# that dies instantly on TERM while the JVM it launched runs shutdown
+	# hooks -- so polling `kill -0 $pid` breaks on the first iteration, SIGKILL
+	# is never sent, and the JVM survives holding the port. Once the group is
+	# the unit of SIGNALLING it must also be the unit of OBSERVATION.
+	group_alive() { kill -0 -- -"${pid}" 2>/dev/null || kill -0 "${pid}" 2>/dev/null; }
+
 	signal_tree TERM
 	waited=0
-	while [ "${waited}" -lt 10 ]; do
-		kill -0 "${pid}" 2>/dev/null || break
+	while [ "${waited}" -lt 10 ] && group_alive; do
 		sleep 1
 		waited=$((waited + 1))
 	done
-	if kill -0 "${pid}" 2>/dev/null; then
+	if group_alive; then
 		signal_tree KILL
 		sleep 1
 	fi
-	rm -f "${pidf}"
 
-	# VERIFY, do not assume. A signal that "succeeded" tells us nothing about
-	# whether the server actually released the port -- which is the property
-	# the user cares about and the one that was silently false before.
-	if curl -fsS "${URL}/v2/languages" >/dev/null 2>&1; then
-		die "signaled pid ${pid} but ${URL} is still serving; something else holds the port"
+	# VERIFY BEFORE REMOVING THE HANDLE. A `die` here with the pid file already
+	# gone leaves no way to identify or stop what is still running -- strictly
+	# worse than not having tried.
+	if server_responds; then
+		die "signaled pid ${pid} but ${URL} is still serving; the pid file is kept at ${pidf} so you can investigate (something else may hold this port)"
 	fi
+	rm -f "${pidf}"
 	echo "stopped"
 }
 
@@ -324,10 +379,14 @@ binary_status() {
 	local pidf pid
 	pidf="$(pid_file)"
 	pid=""
-	[ -f "${pidf}" ] && pid="$(cat "${pidf}" 2>/dev/null || true)"
-	if [ -n "${pid}" ] && pid_is_ours "${pid}"; then
+	[ -f "${pidf}" ] && pid="$(read_pid "${pidf}")"
+	# Group-aware, like stop: a launcher that forks and exits leaves the
+	# recorded leader dead while the real server lives on in the same group.
+	# Checking only the leader reported a live server as "not running" -- and
+	# status is the documented recovery path after a failed stop.
+	if [ -n "${pid}" ] && { pid_is_ours "${pid}" probe || group_looks_ours "${pid}"; }; then
 		echo "running at ${URL} (pid ${pid})"
-		curl -fsS "${URL}/v2/languages" >/dev/null 2>&1 &&
+		server_responds &&
 			echo "health: OK" || echo "health: NOT READY"
 	else
 		echo "not running"
@@ -363,7 +422,7 @@ container_start() {
 	fi
 	echo "starting ${NAME} at ${URL} ..."
 	for _ in $(seq 1 30); do
-		if curl -fsS "${URL}/v2/languages" >/dev/null 2>&1; then
+		if server_responds; then
 			echo "ready at ${URL}"
 			return 0
 		fi
@@ -387,7 +446,7 @@ container_stop() {
 container_status() {
 	if container_running; then
 		echo "running at ${URL}"
-		curl -fsS "${URL}/v2/languages" >/dev/null 2>&1 && echo "health: OK" || echo "health: NOT READY"
+		server_responds && echo "health: OK" || echo "health: NOT READY"
 	else
 		echo "not running"
 		exit 1
