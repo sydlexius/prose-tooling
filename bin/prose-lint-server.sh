@@ -83,6 +83,43 @@ resolve_backend() {
 	die "unknown PROSE_LINT_BACKEND '${value}' (valid: ${BACKENDS})"
 }
 
+LAUNCHERS="languagetool-server languagetool-http-server"
+
+resolve_launcher() {
+	local candidate
+	if [ -n "${PROSE_LINT_JAR:-}" ]; then
+		[ -f "${PROSE_LINT_JAR}" ] && [ -r "${PROSE_LINT_JAR}" ] ||
+			die "PROSE_LINT_JAR '${PROSE_LINT_JAR}' is not a readable file"
+		echo "jar:${PROSE_LINT_JAR}"
+		return 0
+	fi
+	for candidate in ${LAUNCHERS}; do
+		if command -v "${candidate}" >/dev/null 2>&1; then
+			echo "launcher:${candidate}"
+			return 0
+		fi
+	done
+	die "no LanguageTool found: set PROSE_LINT_JAR=/path/to/languagetool-server.jar, or install LanguageTool so one of (${LAUNCHERS}) is on PATH"
+}
+
+require_java() {
+	# NOT `command -v java`: macOS ships /usr/bin/java as a STUB that exists and
+	# is executable but errors until a JDK is installed. Probe for real.
+	command -v java >/dev/null 2>&1 ||
+		die "java not found on PATH; the binary backend needs a JVM"
+	java -version >/dev/null 2>&1 ||
+		die "java on PATH is not a working runtime (on macOS /usr/bin/java is a stub until a JDK is installed)"
+}
+
+binary_start() {
+	local resolved
+	resolved="$(resolve_launcher)" || exit 1
+	case "${resolved}" in
+	jar:*) require_java ;;
+	esac
+	die "binary_start not implemented yet"
+}
+
 container_running() {
 	require_runtime
 	[ -n "$("${RUNTIME}" ps -q -f "name=^${NAME}$")" ]
@@ -172,5 +209,6 @@ runtime)
 	require_runtime
 	echo "${RUNTIME}"
 	;;
-*) die "usage: $0 {start|stop|status|restart|runtime}" ;;
+launcher) resolve_launcher ;;
+*) die "usage: $0 {start|stop|status|restart|runtime|launcher}" ;;
 esac
