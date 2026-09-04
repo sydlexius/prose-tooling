@@ -82,6 +82,15 @@ def test_backend_treats_empty_as_unset(monkeypatch):
     assert _backend() == "container"
 
 
+def test_backend_rejects_whitespace_padded_value(monkeypatch):
+    # The shell side rejects `" docker "`, so accepting `" url "` here would
+    # make the two halves of the same contract disagree (Copilot, PR #41).
+    monkeypatch.setenv("PROSE_LINT_BACKEND", " url ")
+    with pytest.raises(ValueError) as excinfo:
+        _backend()
+    assert "' url '" in str(excinfo.value)
+
+
 def test_unreachable_hint_is_backend_specific():
     assert "prose-lint-server.sh start" in _unreachable_hint("container")
     url_hint = _unreachable_hint("url")

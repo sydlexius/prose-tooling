@@ -328,10 +328,14 @@ def _backend():
     and under a hook that sets it per-repo. An unknown value is an error, not
     a silent fallback.
     """
-    # `or` (not a get() default) so an empty/whitespace value reads as unset,
-    # matching the shell side's `[ -n "${PROSE_LINT_RUNTIME:-}" ]` test. A blank
-    # var almost always means "not configured", not "configured to nothing".
-    value = os.environ.get("PROSE_LINT_BACKEND", "").strip() or "container"
+    # A blank var reads as unset (it almost always means "not configured"),
+    # matching the shell side's `[ -n "${PROSE_LINT_RUNTIME:-}" ]` test. But the
+    # value itself is validated UNSTRIPPED: the shell rejects `" docker "`, so
+    # accepting `" url "` here would make the two halves disagree.
+    raw = os.environ.get("PROSE_LINT_BACKEND", "")
+    if not raw.strip():
+        return "container"
+    value = raw
     if value not in _BACKENDS:
         raise ValueError(
             f"unknown PROSE_LINT_BACKEND {value!r} (valid: {', '.join(_BACKENDS)})"
