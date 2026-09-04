@@ -107,32 +107,102 @@ require_java() {
 	# is executable but errors until a JDK is installed. Probe for real.
 	command -v java >/dev/null 2>&1 ||
 		die "java not found on PATH; the binary backend needs a JVM"
-	java -version >/dev/null 2>&1 ||
-		die "java on PATH is not a working runtime (on macOS /usr/bin/java is a stub until a JDK is installed)"
+	# BOUNDED: an unbounded probe lets a wedged JVM (stalled NFS mount, a bad
+	# _JAVA_OPTIONS) hang a pre-commit hook or CI step with no output at all.
+	# PROSE_LINT_START_TIMEOUT does not cover this -- the probe runs first.
+	local timeout_cmd=""
+	command -v timeout >/dev/null 2>&1 && timeout_cmd="timeout"
+	[ -z "${timeout_cmd}" ] && command -v gtimeout >/dev/null 2>&1 && timeout_cmd="gtimeout"
+	if [ -n "${timeout_cmd}" ]; then
+		"${timeout_cmd}" 10 java -version >/dev/null 2>&1 ||
+			die "java on PATH is not a working runtime, or did not respond within 10s (on macOS /usr/bin/java is a stub until a JDK is installed)"
+	else
+		java -version >/dev/null 2>&1 ||
+			die "java on PATH is not a working runtime (on macOS /usr/bin/java is a stub until a JDK is installed)"
+	fi
 }
 
-pid_file() {
+state_dir() {
 	local dir="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}"
-	echo "${dir%/}/prose-lint-lt-${HOST_PORT}.pid"
+	echo "${dir%/}"
 }
 
-log_file() {
-	local dir="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}"
-	echo "${dir%/}/prose-lint-lt-${HOST_PORT}.log"
+pid_file() { echo "$(state_dir)/prose-lint-lt-${HOST_PORT}.pid"; }
+log_file() { echo "$(state_dir)/prose-lint-lt-${HOST_PORT}.log"; }
+
+# Echoes a sane pid from a pid file, or nothing. Trailing newlines and stray
+# whitespace are TRIMMED rather than rejected: `echo $! > file` writes one, and
+# treating our own output as unreadable made stop() abandon a live server.
+# 0 and 1 are refused outright -- `kill -0 0` SUCCEEDS (it means "my whole
+# process group"), so accepting 0 would leave only `ps` between us and
+# signaling the caller's shell.
+read_pid() {
+	local raw
+	# `read` is a BUILTIN, unlike `cat`: reading our own pid file must not
+	# depend on an external binary being resolvable. When it did, a PATH that
+	# lacked `cat` made every pid look unreadable, so stop() deleted the file
+	# and abandoned a live server -- silently, and with a message blaming the
+	# file. Reading state is not the place to take a dependency.
+	IFS= read -r raw <"$1" 2>/dev/null || raw=""
+	raw="${raw//[[:space:]]/}"
+	case "${raw}" in
+	'' | *[!0-9]*) return 0 ;;
+	esac
+	[ "${raw}" -gt 1 ] 2>/dev/null || return 0
+	echo "${raw}"
 }
 
 # True when the pid is alive AND its command line still looks like our server.
 # `ps -ww` because a `java -cp` command line is long, and a truncated one would
 # fail to match, making stop() refuse to act on its own process.
 pid_is_ours() {
-	local pid="$1"
+	local pid="$1" cmdline
 	kill -0 "${pid}" 2>/dev/null || return 1
-	ps -ww -o command= -p "${pid}" 2>/dev/null |
-		grep -qiE 'languagetool|HTTPServer'
+	# `ps` is external and could be unavailable (a stripped container, a
+	# restricted PATH). Distinguish "ps says this is not ours" from "ps could
+	# not run": the first is a refusal, the second must not silently become
+	# one, or a missing binary makes the tool abandon a live server.
+	command -v ps >/dev/null 2>&1 || {
+		die "cannot verify pid ${pid} -- 'ps' is not available; refusing to signal blindly"
+	}
+	cmdline="$(ps -ww -o command= -p "${pid}" 2>/dev/null || true)"
+	case "${cmdline}" in
+	*[Ll]anguage[Tt]ool* | *HTTPServer*) return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
+# Launch $@ detached, in its own process group, with output to $1.
+# Sets SPAWNED_PID to the group leader.
+#
+# BOTH properties are required and they come from different mechanisms:
+#   - `nohup` makes the child immune to the SIGHUP the shell sends its jobs on
+#     exit. Without it the server dies with the script that started it.
+#   - a NEW PROCESS GROUP is what lets stop() take down the whole tree. The
+#     recorded pid is the wrapper for a launcher that runs java without exec,
+#     so signaling it alone orphans the JVM.
+# `set -m` gives the group but NOT hup-immunity (measured: the child dies when
+# the parent exits), so dropping nohup for it silently breaks detachment.
+spawn_detached() {
+	local logf="$1"
+	shift
+	# PROBE setsid, do not just look for it: a broken symlink satisfies
+	# `command -v` and then fails to execute -- the same "exists but does not
+	# work" trap as the macOS java stub, and it silently loses the launch.
+	if command -v setsid >/dev/null 2>&1 && setsid true >/dev/null 2>&1; then
+		setsid nohup "$@" >"${logf}" 2>&1 &
+	else
+		# macOS has no setsid. Job control gives the background job its own
+		# process group; nohup supplies the hup-immunity it does not.
+		set -m
+		{ nohup "$@" >"${logf}" 2>&1 & }
+		set +m
+	fi
+	SPAWNED_PID=$!
 }
 
 binary_start() {
-	local resolved kind value pidf logf timeout waited
+	local resolved kind value pidf logf timeout waited runtime_dir existing
 	if curl -fsS "${URL}/v2/languages" >/dev/null 2>&1; then
 		echo "already running at ${URL}"
 		return 0
@@ -143,18 +213,38 @@ binary_start() {
 	pidf="$(pid_file)"
 	logf="$(log_file)"
 	timeout="${PROSE_LINT_START_TIMEOUT:-30}"
+	runtime_dir="$(state_dir)"
+	[ -d "${runtime_dir}" ] && [ -w "${runtime_dir}" ] ||
+		die "state directory '${runtime_dir}' is not writable; set XDG_RUNTIME_DIR or TMPDIR to a writable directory"
 
-	# Detached, with output redirected to the log: an inherited stdout would
-	# keep a CI step's pipe open and hang the job until the runner's timeout.
+	# Refuse to launch a second server over a live one. The health probe above
+	# misses the STARTUP WINDOW -- a real JVM takes 10-30s to bind -- which is
+	# exactly when a pre-commit hook and a manual start collide.
+	if [ -f "${pidf}" ]; then
+		existing="$(read_pid "${pidf}")"
+		if [ -n "${existing}" ] && pid_is_ours "${existing}"; then
+			die "a LanguageTool process (pid ${existing}) is already starting or running; stop it first"
+		fi
+	fi
+
+	# `setsid` (or a setsid-free fallback) puts the child in its OWN PROCESS
+	# GROUP. This is load-bearing, not tidiness: LanguageTool's own launcher is
+	# a shell wrapper that runs java WITHOUT exec, so the recorded pid is the
+	# WRAPPER and killing it alone orphans the JVM, which keeps holding the
+	# port. Recording a group lets stop take down the whole tree.
+	#
+	# Output goes to the log, never inherited: an inherited stdout keeps a CI
+	# step's pipe open and hangs the job until the runner's timeout.
 	# No --public flag, so the server binds loopback only.
 	if [ "${kind}" = "jar" ]; then
 		require_java
-		nohup java -Xmx1g -cp "${value}" org.languagetool.server.HTTPServer \
-			--port "${HOST_PORT}" >"${logf}" 2>&1 &
+		spawn_detached "${logf}" java -Xmx1g -cp "${value}" \
+			org.languagetool.server.HTTPServer --port "${HOST_PORT}"
 	else
-		nohup "${value}" --port "${HOST_PORT}" >"${logf}" 2>&1 &
+		spawn_detached "${logf}" "${value}" --port "${HOST_PORT}"
 	fi
-	echo $! >"${pidf}"
+	echo "${SPAWNED_PID}" >"${pidf}" ||
+		die "cannot write pid file '${pidf}'"
 
 	echo "starting LanguageTool at ${URL} ..."
 	waited=0
@@ -176,14 +266,18 @@ binary_stop() {
 		echo "not running"
 		return 0
 	fi
-	pid="$(cat "${pidf}" 2>/dev/null || true)"
-	case "${pid}" in
-	'' | *[!0-9]*)
+	if [ ! -r "${pidf}" ]; then
+		# Do NOT delete: the file exists but cannot be read (permissions, a
+		# transient fault). Deleting it would abandon a possibly-live server
+		# and lose the only handle we have on it.
+		die "pid file '${pidf}' exists but is not readable; cannot safely stop"
+	fi
+	pid="$(read_pid "${pidf}")"
+	if [ -z "${pid}" ]; then
 		rm -f "${pidf}"
-		echo "not running (unreadable pid file removed)"
+		echo "not running (pid file held no usable pid; removed)"
 		return 0
-		;;
-	esac
+	fi
 	if ! kill -0 "${pid}" 2>/dev/null; then
 		rm -f "${pidf}"
 		echo "not running (stale pid file removed)"
@@ -196,7 +290,15 @@ binary_stop() {
 		echo "not running (pid ${pid} was recycled by another process; not signaled)"
 		return 0
 	fi
-	kill "${pid}" 2>/dev/null || die "failed to signal pid ${pid}"
+
+	# Signal the process GROUP, not just the recorded pid. LanguageTool's
+	# launcher is a shell wrapper that runs java WITHOUT exec, so the recorded
+	# pid is the wrapper: killing it alone leaves the JVM holding the port,
+	# whereupon `start` reports "already running" and the user has a server
+	# this tool can never stop.
+	signal_tree() { kill -"$1" -- -"${pid}" 2>/dev/null || kill -"$1" "${pid}" 2>/dev/null || true; }
+
+	signal_tree TERM
 	waited=0
 	while [ "${waited}" -lt 10 ]; do
 		kill -0 "${pid}" 2>/dev/null || break
@@ -204,12 +306,18 @@ binary_stop() {
 		waited=$((waited + 1))
 	done
 	if kill -0 "${pid}" 2>/dev/null; then
-		kill -9 "${pid}" 2>/dev/null || true
-		echo "stopped (SIGKILL after ${waited}s)"
-	else
-		echo "stopped"
+		signal_tree KILL
+		sleep 1
 	fi
 	rm -f "${pidf}"
+
+	# VERIFY, do not assume. A signal that "succeeded" tells us nothing about
+	# whether the server actually released the port -- which is the property
+	# the user cares about and the one that was silently false before.
+	if curl -fsS "${URL}/v2/languages" >/dev/null 2>&1; then
+		die "signaled pid ${pid} but ${URL} is still serving; something else holds the port"
+	fi
+	echo "stopped"
 }
 
 binary_status() {

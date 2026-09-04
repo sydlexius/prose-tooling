@@ -29,9 +29,20 @@ def _bin_dir(tmp_path, *names):
     # is bash builtins only), so symlink the ones the script actually uses.
     # Everything else is deliberately absent: a real java or languagetool-server
     # on the developer's machine must not satisfy a lookup a test means to fail.
-    for tool in ("bash", "rm", "sleep", "cat", "ps", "grep", "curl", "kill"):
+    # `setsid` is absent on macOS by design -- the script falls back to `set -m`
+    # there, and omitting it here keeps that fallback on the tested path.
+    # `nohup` is the one whose absence made the launch path silently untested:
+    # every start failed with "nohup: command not found", no child was ever
+    # spawned, and the assertions (a pid file exists, it returned fast) all
+    # still held. `setsid` is absent on macOS by design -- the script falls
+    # back to `set -m` there, keeping that fallback on the tested path.
+    for tool in ("bash", "rm", "sleep", "cat", "ps", "grep", "curl", "kill",
+                 "nohup", "setsid", "env"):
         real = shutil.which(tool)
-        if real and not (d / tool).exists():
+        # `not (d / tool).exists()` is False for a DANGLING symlink, so guard on
+        # the link itself; and skip tools the host lacks (macOS has no setsid)
+        # rather than creating a broken link that `command -v` would accept.
+        if real and not (d / tool).is_symlink():
             (d / tool).symlink_to(real)
     assert (d / "bash").exists(), "bash is required to run the server script"
     return d
@@ -213,3 +224,137 @@ def test_status_reports_not_running_without_a_pid_file(tmp_path):
     r = _run(d, "status", TMPDIR=str(tmp_path), XDG_RUNTIME_DIR=str(tmp_path))
     assert r.returncode != 0
     assert "not running" in r.stdout
+
+
+def _wrapper_launcher(d, name="languagetool-server"):
+    """A launcher shaped like LanguageTool's own: runs java WITHOUT exec.
+
+    This is the shape that broke stop(): the recorded pid is the WRAPPER, and
+    signaling it alone orphans the JVM, which keeps holding the port.
+    """
+    # `exec -a` keeps the LanguageTool argv visible in `ps` after the exec.
+    # A plain `exec sleep 300` REPLACES the process image and erases the
+    # marker, so the stub would look nothing like a real JVM to `ps` -- which
+    # is both what pid_is_ours matches on and what these tests assert.
+    (d / "fakejava").write_text(
+        "#!/bin/sh\n"
+        "exec -a \"java $* \" /bin/sleep 300\n"
+    )
+    (d / "fakejava").chmod(0o755)
+    stub = d / name
+    stub.write_text(
+        "#!/bin/sh\n"
+        "# Shaped like LanguageTool's own launcher: runs java WITHOUT exec, so\n"
+        "# the recorded pid is this WRAPPER and the JVM is a child.\n"
+        "fakejava -cp /opt/lt/languagetool-server.jar "
+        "org.languagetool.server.HTTPServer \"$@\" &\n"
+        "wait\n"
+    )
+    stub.chmod(0o755)
+    return stub
+
+
+def _descendants_alive(marker):
+    out = subprocess.run(
+        ["ps", "-ww", "-eo", "pid=,command="], capture_output=True, text=True
+    ).stdout
+    return [ln for ln in out.splitlines() if marker in ln and "grep" not in ln]
+
+
+def test_start_actually_spawns_a_child(tmp_path):
+    # The launch path must EXECUTE. Replacing the launch command with garbage
+    # previously left all 13 tests green, because nohup was not on the stub
+    # PATH and no child was ever spawned.
+    d = _bin_dir(tmp_path)
+    _wrapper_launcher(d)
+    r = _run(d, "start", TMPDIR=str(tmp_path), XDG_RUNTIME_DIR=str(tmp_path),
+             PROSE_LINT_START_TIMEOUT="3")
+    try:
+        assert r.returncode != 0  # never becomes healthy
+        assert "did not become ready" in r.stderr
+        assert _descendants_alive("org.languagetool.server.HTTPServer"), (
+            "start did not actually spawn the launcher"
+        )
+    finally:
+        _run(d, "stop", TMPDIR=str(tmp_path), XDG_RUNTIME_DIR=str(tmp_path))
+        subprocess.run(["pkill", "-f", "org.languagetool.server.HTTPServer"])
+        subprocess.run(["pkill", "-f", "fakejava"])
+
+
+def test_stop_reaps_the_whole_tree_not_just_the_wrapper(tmp_path):
+    # THE regression test for the orphaned-JVM bug: with a launcher that runs
+    # java without exec, stop must take down the child too, not report
+    # "stopped" while the JVM keeps holding the port.
+    d = _bin_dir(tmp_path)
+    _wrapper_launcher(d)
+    _run(d, "start", TMPDIR=str(tmp_path), XDG_RUNTIME_DIR=str(tmp_path),
+         PROSE_LINT_START_TIMEOUT="3")
+    try:
+        assert _descendants_alive("org.languagetool.server.HTTPServer"), "setup failed"
+        r = _run(d, "stop", TMPDIR=str(tmp_path), XDG_RUNTIME_DIR=str(tmp_path))
+        assert r.returncode == 0, r.stderr
+        survivors = _descendants_alive("org.languagetool.server.HTTPServer")
+        assert not survivors, f"stop orphaned the server: {survivors}"
+    finally:
+        subprocess.run(["pkill", "-f", "org.languagetool.server.HTTPServer"])
+        subprocess.run(["pkill", "-f", "fakejava"])
+
+
+def test_start_refuses_to_launch_over_a_live_server(tmp_path):
+    # The health probe misses the startup window, when a hook and a manual
+    # start collide -- previously that leaked a second, unstoppable process.
+    d = _bin_dir(tmp_path)
+    _wrapper_launcher(d)
+    _run(d, "start", TMPDIR=str(tmp_path), XDG_RUNTIME_DIR=str(tmp_path),
+         PROSE_LINT_START_TIMEOUT="3")
+    try:
+        r = _run(d, "start", TMPDIR=str(tmp_path), XDG_RUNTIME_DIR=str(tmp_path),
+                 PROSE_LINT_START_TIMEOUT="3")
+        assert r.returncode != 0
+        assert "already starting or running" in r.stderr
+    finally:
+        _run(d, "stop", TMPDIR=str(tmp_path), XDG_RUNTIME_DIR=str(tmp_path))
+        subprocess.run(["pkill", "-f", "org.languagetool.server.HTTPServer"])
+        subprocess.run(["pkill", "-f", "fakejava"])
+
+
+def test_start_dies_actionably_on_an_unwritable_state_dir(tmp_path):
+    d = _bin_dir(tmp_path)
+    _wrapper_launcher(d)
+    ro = tmp_path / "readonly"
+    ro.mkdir()
+    ro.chmod(0o500)
+    try:
+        r = _run(d, "start", TMPDIR=str(ro), XDG_RUNTIME_DIR=str(ro),
+                 PROSE_LINT_START_TIMEOUT="2")
+        assert r.returncode != 0
+        assert "not writable" in r.stderr
+        assert "prose-lint-server:" in r.stderr  # our error, not a raw bash one
+    finally:
+        ro.chmod(0o700)
+
+
+def test_launcher_precedence_when_both_are_present(tmp_path):
+    # Reversing LAUNCHERS previously left the suite green: each test stubbed
+    # only one name, so nothing pinned the order.
+    d = _bin_dir(tmp_path, "languagetool-server", "languagetool-http-server")
+    r = _run(d, "launcher")
+    assert r.returncode == 0
+    assert r.stdout.strip() == "launcher:languagetool-server"
+
+
+def test_pid_file_with_a_trailing_newline_is_honored(tmp_path):
+    # `echo $! > file` writes a trailing newline, so treating it as unreadable
+    # made stop() abandon its OWN live server.
+    d = _bin_dir(tmp_path)
+    victim = subprocess.Popen(["sleep", "30"])
+    try:
+        (tmp_path / f"prose-lint-lt-{TEST_PORT}.pid").write_text(f"{victim.pid}\n")
+        r = _run(d, "stop", TMPDIR=str(tmp_path), XDG_RUNTIME_DIR=str(tmp_path))
+        # Not ours (a bare `sleep`), so it must be refused -- but as RECYCLED,
+        # proving the pid was parsed, not as "unreadable".
+        assert "recycled" in r.stdout.lower()
+        assert victim.poll() is None
+    finally:
+        victim.kill()
+        victim.wait()
