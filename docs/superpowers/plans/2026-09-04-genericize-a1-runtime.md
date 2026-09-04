@@ -442,7 +442,7 @@ Expected: all passed, including the new test.
 
 Append to `docs/CONFIG.md`:
 
-```markdown
+````markdown
 ## Backends and runtimes
 
 Where the LanguageTool server lives is configured entirely by environment
@@ -486,7 +486,7 @@ bin/prose-lint-server.sh runtime   # prints e.g. podman
 
 Rootless podman and nerdctl work: the container binds to `127.0.0.1` and the
 `--restart unless-stopped` policy is supported by all three runtimes.
-```
+````
 
 - [ ] **Step 6: Update README.md and CLAUDE.md**
 
@@ -549,7 +549,7 @@ git commit -m "docs: document PROSE_LINT_RUNTIME and PROSE_LINT_BACKEND (#15)"
 
 ## Done criteria
 
-- `bin/prose-lint-server.sh` contains no bare `docker` invocation (`grep -n '\bdocker \b' bin/prose-lint-server.sh` returns only comment/doc text).
+- `bin/prose-lint-server.sh` contains no bare `docker` invocation (`grep -nE '(^|[^[:alnum:]_])docker[[:space:]]' bin/prose-lint-server.sh` returns only comment/doc text).
 - `prose-lint-server.sh runtime` resolves per the documented order and dies loudly on a bad or absent runtime.
 - `PROSE_LINT_BACKEND=url` never starts a container, and an invalid value exits 2 with a named error.
 - No new CLI flags; unset environment reproduces today's behavior exactly (the three original `test_autostart.py` tests pass unmodified).
