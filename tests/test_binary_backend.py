@@ -60,7 +60,12 @@ def _bin_dir(tmp_path, *names):
 #
 # Well away from 8081, which is the default and holds the developer's real
 # container.
-_PORT_COUNTER = itertools.count(18100)
+# Seeded per xdist worker: a module-level counter restarts at the same value in
+# every worker process, so parallel runs would hand two tests the same port --
+# the exact shared-state problem the fixture exists to remove.
+_WORKER = os.environ.get("PYTEST_XDIST_WORKER", "gw0")
+_WORKER_OFFSET = int("".join(c for c in _WORKER if c.isdigit()) or 0) * 200
+_PORT_COUNTER = itertools.count(18100 + _WORKER_OFFSET)
 
 
 @pytest.fixture
@@ -82,7 +87,10 @@ def _no_stub_servers_survive_the_session():
         ["ps", "-eo", "pgid=,command="], capture_output=True, text=True
     ).stdout
     for line in out.splitlines():
-        if "fakejava" not in line and "org.languagetool.server.HTTPServer" not in line:
+        # `fakejava` ONLY: it is a stub-only token, so this cannot match a
+        # developer's real LanguageTool server or an editor whose argv happens
+        # to contain the class name. Our stubs always run via fakejava.
+        if "fakejava" not in line:
             continue
         head = line.split(None, 1)[0]
         if not head.isdigit():
@@ -532,3 +540,18 @@ def test_stop_waits_before_escalating_to_kill(tmp_path, port, reaper):
     assert not _descendants_alive("org.languagetool.server.HTTPServer", pgid)
     # It had to wait out the TERM grace period rather than give up at once.
     assert elapsed >= 2, f"stop returned in {elapsed:.1f}s -- it never waited"
+
+
+def test_status_works_without_cat_on_path(tmp_path, port, reaper):
+    # The whole point of read_pid is surviving a PATH that lacks `cat`, but
+    # every stub PATH symlinks it, so reverting binary_status to `cat` left the
+    # suite green. Build a PATH deliberately without it.
+    d = _bin_dir(tmp_path)
+    _stubborn_launcher(d)
+    _run(d, "start", port, TMPDIR=str(tmp_path), XDG_RUNTIME_DIR=str(tmp_path),
+         PROSE_LINT_START_TIMEOUT="2")
+    pgid = int((tmp_path / f"prose-lint-lt-{port}.pid").read_text().strip())
+    reaper(pgid)
+    (d / "cat").unlink()  # the condition read_pid exists to survive
+    r = _run(d, "status", port, TMPDIR=str(tmp_path), XDG_RUNTIME_DIR=str(tmp_path))
+    assert "running at" in r.stdout, f"status broke without cat: {r.stdout} {r.stderr}"

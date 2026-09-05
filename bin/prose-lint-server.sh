@@ -176,7 +176,15 @@ group_looks_ours() {
 	# would repeat the very mistake this function exists to undo -- `cat` and
 	# `grep` already made stop abandon a live server when they were missing.
 	local first rest
+	[ -n "${pgid}" ] || return 1
 	while IFS= read -r line; do
+		# `ps` RIGHT-PADS the pgid column, so most lines start with spaces --
+		# and `${line%%[[:space:]]*}` on a space-leading line strips the WHOLE
+		# line, yielding "". Without this trim the comparison only ever matched
+		# a pgid exactly as wide as the column (5 digits here), so the function
+		# silently never fired for a 4-digit pgid: stop then called a live
+		# server "recycled", removed the pid file and abandoned it.
+		line="${line#"${line%%[![:space:]]*}"}"
 		first="${line%%[[:space:]]*}"
 		[ "${first}" = "${pgid}" ] || continue
 		rest="${line#"${first}"}"
