@@ -88,8 +88,11 @@ LAUNCHERS="languagetool-server languagetool-http-server"
 resolve_launcher() {
 	local candidate
 	if [ -n "${PROSE_LINT_JAR:-}" ]; then
-		[ -f "${PROSE_LINT_JAR}" ] && [ -r "${PROSE_LINT_JAR}" ] ||
-			die "PROSE_LINT_JAR '${PROSE_LINT_JAR}' is not a readable file"
+		if [ ! -f "${PROSE_LINT_JAR}" ]; then
+			die "PROSE_LINT_JAR '${PROSE_LINT_JAR}' does not exist"
+		elif [ ! -r "${PROSE_LINT_JAR}" ]; then
+			die "PROSE_LINT_JAR '${PROSE_LINT_JAR}' exists but is not readable"
+		fi
 		echo "jar:${PROSE_LINT_JAR}"
 		return 0
 	fi
@@ -131,7 +134,22 @@ server_responds() {
 
 state_dir() {
 	local dir="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}"
-	echo "${dir%/}"
+	# A PRIVATE per-user subdirectory, not the shared parent. /tmp is
+	# world-writable and our file names are predictable per port, so another
+	# local user could pre-create prose-lint-lt-<port>.log as a symlink and have
+	# `>` truncate whatever it points at. Linux fs.protected_symlinks blocks
+	# that; macOS has no equivalent default, and this is a macOS-first tool.
+	# mkdir -m 700 is not enough on its own (it no-ops on an existing dir), so
+	# the permissions are re-asserted and ownership is verified below.
+	dir="${dir%/}/prose-lint-$(id -u)"
+	# No `-p`: with it, `-m` applies only to the deepest directory (SC2174), and
+	# the parent already exists anyway. mkdir also fails if the path exists as a
+	# symlink, which is the attack being closed.
+	if [ ! -d "${dir}" ]; then
+		mkdir -m 700 "${dir}" 2>/dev/null ||
+			die "cannot create state directory '${dir}'"
+	fi
+	echo "${dir}"
 }
 
 pid_file() { echo "$(state_dir)/prose-lint-lt-${HOST_PORT}.pid"; }
@@ -167,6 +185,14 @@ read_pid() {
 # True when the pid is alive AND its command line still looks like our server.
 # `ps -ww` because a `java -cp` command line is long, and a truncated one would
 # fail to match, making stop() refuse to act on its own process.
+# Is anything in the group still alive? Signalling and observation must use the
+# same unit: a wrapper that dies instantly on TERM leaves the leader gone while
+# the real server lives on in the same group.
+group_alive() {
+	local pid="$1"
+	kill -0 -- -"${pid}" 2>/dev/null || kill -0 "${pid}" 2>/dev/null
+}
+
 # Does any process in the group still look like our server? Used when the
 # recorded leader has exited but the group may still hold the real process.
 group_looks_ours() {
@@ -249,7 +275,7 @@ spawn_detached() {
 }
 
 binary_start() {
-	local resolved kind value pidf logf timeout waited runtime_dir existing
+	local resolved kind value pidf logf timeout deadline runtime_dir existing
 	if server_responds; then
 		echo "already running at ${URL}"
 		return 0
@@ -260,16 +286,30 @@ binary_start() {
 	pidf="$(pid_file)"
 	logf="$(log_file)"
 	timeout="${PROSE_LINT_START_TIMEOUT:-30}"
+	case "${timeout}" in
+	'' | *[!0-9]*)
+		die "PROSE_LINT_START_TIMEOUT '${timeout}' is not a whole number of seconds"
+		;;
+	esac
+	[ "${timeout}" -gt 0 ] ||
+		die "PROSE_LINT_START_TIMEOUT must be greater than 0"
 	runtime_dir="$(state_dir)"
-	[ -d "${runtime_dir}" ] && [ -w "${runtime_dir}" ] ||
+	if [ ! -d "${runtime_dir}" ]; then
+		die "state directory '${runtime_dir}' does not exist; set XDG_RUNTIME_DIR or TMPDIR to a writable directory"
+	elif [ ! -w "${runtime_dir}" ]; then
 		die "state directory '${runtime_dir}' is not writable; set XDG_RUNTIME_DIR or TMPDIR to a writable directory"
+	fi
 
 	# Refuse to launch a second server over a live one. The health probe above
 	# misses the STARTUP WINDOW -- a real JVM takes 10-30s to bind -- which is
 	# exactly when a pre-commit hook and a manual start collide.
 	if [ -f "${pidf}" ]; then
 		existing="$(read_pid "${pidf}")"
-		if [ -n "${existing}" ] && pid_is_ours "${existing}" probe; then
+		# Group-aware, like stop and status. Checking only the leader let a
+		# forking launcher's dead wrapper pass the guard, spawn a SECOND JVM,
+		# and overwrite the pid file -- orphaning the first tree permanently.
+		if [ -n "${existing}" ] &&
+			{ pid_is_ours "${existing}" probe || group_looks_ours "${existing}"; }; then
 			die "a LanguageTool process (pid ${existing}) is already starting or running; stop it first"
 		fi
 	fi
@@ -299,14 +339,17 @@ binary_start() {
 	fi
 
 	echo "starting LanguageTool at ${URL} ..."
-	waited=0
-	while [ "${waited}" -lt "${timeout}" ]; do
+	# Measured against the CLOCK, not by counting iterations. Each pass costs up
+	# to 5s of bounded curl plus a 1s sleep, so counting iterations made
+	# PROSE_LINT_START_TIMEOUT=30 block for as long as ~180s while reporting
+	# "within 30s" -- a wrong number and a wrong diagnosis.
+	deadline=$(($(date +%s) + timeout))
+	while [ "$(date +%s)" -lt "${deadline}" ]; do
 		if server_responds; then
 			echo "ready at ${URL}"
 			return 0
 		fi
 		sleep 1
-		waited=$((waited + 1))
 	done
 	die "server did not become ready within ${timeout}s (see: ${logf})"
 }
@@ -360,15 +403,13 @@ binary_stop() {
 	# hooks -- so polling `kill -0 $pid` breaks on the first iteration, SIGKILL
 	# is never sent, and the JVM survives holding the port. Once the group is
 	# the unit of SIGNALLING it must also be the unit of OBSERVATION.
-	group_alive() { kill -0 -- -"${pid}" 2>/dev/null || kill -0 "${pid}" 2>/dev/null; }
-
 	signal_tree TERM
 	waited=0
-	while [ "${waited}" -lt 10 ] && group_alive; do
+	while [ "${waited}" -lt 10 ] && group_alive "${pid}"; do
 		sleep 1
 		waited=$((waited + 1))
 	done
-	if group_alive; then
+	if group_alive "${pid}"; then
 		signal_tree KILL
 		sleep 1
 	fi
@@ -376,6 +417,13 @@ binary_stop() {
 	# VERIFY BEFORE REMOVING THE HANDLE. A `die` here with the pid file already
 	# gone leaves no way to identify or stop what is still running -- strictly
 	# worse than not having tried.
+	# Verify the GROUP is gone, not just the port. A process that survives
+	# SIGKILL but never serves HTTP passes a port-only check, so stop would
+	# print "stopped", delete the pid file, and lose the only handle on the
+	# survivor -- which is exactly what keeping the file below guards against.
+	if group_alive "${pid}"; then
+		die "signaled pid ${pid} but its process group is still alive; the pid file is kept at ${pidf} so you can investigate"
+	fi
 	if server_responds; then
 		die "signaled pid ${pid} but ${URL} is still serving; the pid file is kept at ${pidf} so you can investigate (something else may hold this port)"
 	fi

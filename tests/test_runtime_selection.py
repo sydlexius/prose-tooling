@@ -196,7 +196,12 @@ def test_dispatch_rejects_a_missing_handler(tmp_path):
     # exist, and silently lost its teeth the moment that backend was
     # implemented. A guard's test should not depend on what happens to be
     # unfinished elsewhere.
-    script = SERVER.read_text().replace("container_status() {", "_unused_status() {", 1)
+    original = SERVER.read_text()
+    script = original.replace("container_status() {", "_unused_status() {", 1)
+    # str.replace returns the input UNCHANGED when the anchor is absent, so a
+    # reformat would silently run the real handler and blame container
+    # behavior for a missing anchor. Pin the precondition.
+    assert script != original, "anchor 'container_status() {' not found in the script"
     patched = tmp_path / "patched-server.sh"
     patched.write_text(script)
     patched.chmod(0o755)
