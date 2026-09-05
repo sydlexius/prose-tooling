@@ -187,11 +187,31 @@ def test_multi_word_backend_value_is_rejected(tmp_path):
     assert "url binary" in r.stderr
 
 
-def test_unimplemented_backend_verb_fails_loudly(tmp_path):
-    # An indirect dispatch to a missing function must not look like success:
-    # bash's "command not found" can exit 0 on some paths, which for `status`
-    # would read as "the server is fine" when nothing was checked.
-    r = _run_subcmd(_stub_path(tmp_path, "docker"), "status", PROSE_LINT_BACKEND="binary")
+def test_dispatch_rejects_a_missing_handler(tmp_path):
+    # An indirect dispatch to a missing function must resolve to an actionable
+    # message, not a raw "command not found" naming an internal symbol.
+    #
+    # Driven by neutering one handler rather than by naming an unfinished
+    # backend: the original form used `binary status` while binary_* did not
+    # exist, and silently lost its teeth the moment that backend was
+    # implemented. A guard's test should not depend on what happens to be
+    # unfinished elsewhere.
+    original = SERVER.read_text()
+    script = original.replace("container_status() {", "_unused_status() {", 1)
+    # str.replace returns the input UNCHANGED when the anchor is absent, so a
+    # reformat would silently run the real handler and blame container
+    # behavior for a missing anchor. Pin the precondition.
+    assert script != original, "anchor 'container_status() {' not found in the script"
+    patched = tmp_path / "patched-server.sh"
+    patched.write_text(script)
+    patched.chmod(0o755)
+    environ = dict(os.environ)
+    environ["PATH"] = _stub_path(tmp_path, "docker")
+    environ.pop("PROSE_LINT_RUNTIME", None)
+    environ["PROSE_LINT_BACKEND"] = "container"
+    r = subprocess.run(
+        [str(patched), "status"], capture_output=True, text=True, env=environ
+    )
     assert r.returncode != 0
     assert "does not implement" in r.stderr
 
