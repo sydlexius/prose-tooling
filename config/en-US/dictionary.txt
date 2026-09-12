@@ -36,6 +36,21 @@ ZeroSSL
 EAB
 toolchain
 prereqs
+heredoc
+heredocs
+substring
+substrings
+speedup
+speedups
+SHA
+SHAs
+rc
+
+# CI runner labels. Like the browser engines below, the case-insensitive match
+# is what covers the lowercase identifier (`ubuntu-latest`, `macos-latest`) as
+# it appears verbatim in a workflow or a gate report.
+ubuntu
+macos
 
 # Browser engines (proper nouns; case-insensitive match also covers the
 # lowercase Playwright CLI identifiers firefox/webkit)

@@ -6,4 +6,8 @@ Immich
 LanguageTool
 OrbStack
 Unraid
+awk
+gh
+jq
 markdownlint
+shellcheck
