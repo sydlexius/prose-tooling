@@ -3,6 +3,10 @@
 # CodeRabbit auto-review is disabled: CodeRabbit reviews only when explicitly
 # requested with `@coderabbitai review`. It will not auto-review new or updated
 # pull requests. (Manual review commands remain available.)
+# Inherit the organization CodeRabbit settings for every key not set here.
+# Without this, CodeRabbit uses ONLY this file and ignores the org config.
+inheritance: true
+
 language: en-US
 reviews:
   auto_review:
